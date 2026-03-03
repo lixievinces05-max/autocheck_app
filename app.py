@@ -16,6 +16,11 @@ from reportlab.lib.pagesizes import A4
 
 import matplotlib.pyplot as plt
 
+# Excel PRO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
 CSV_PATH = "sensores.csv"
 
 # -------------------- Rangos OK / ALERT --------------------
@@ -46,6 +51,19 @@ SENSOR_META = {
     "lambda": ("Lambda", ""),
     "maf_gps": ("MAF (flujo de aire)", "g/s"),
     "fuel_trim_pct": ("Fuel Trim", "%"),
+}
+
+# -------------------- Diccionario DTC (explicación técnica) --------------------
+DTC_INFO = {
+    "P0101": "MAF rango/rendimiento. Posible MAF sucio, fuga admisión, filtro, cableado, incoherencia con MAP.",
+    "P0106": "MAP rango/rendimiento. Posible sensor MAP, mangueras, actuador, cableado o presión incoherente.",
+    "P0130": "Circuito sonda lambda (O2). Posible sonda, cableado, fugas escape, mezcla fuera de control.",
+    "P0171": "Mezcla pobre (Bank 1). Posible fuga aire, baja presión combustible, MAF subestima, inyectores sucios.",
+    "P0172": "Mezcla rica (Bank 1). Posible presión alta, inyectores goteando, EVAP, MAF sobreestima.",
+    "P0217": "Temperatura motor excesiva. Posible refrigeración: nivel, termostato, ventilador, bomba.",
+    "P0300": "Fallo de encendido aleatorio. Posible bujías/bobinas, inyección, compresión, fugas.",
+    "P0420": "Eficiencia catalizador baja. Posible catalizador, sonda O2, mezcla rica/pobre prolongada.",
+    "P0562": "Tensión sistema baja. Posible batería, alternador, masa/borne, consumo parasitario.",
 }
 
 # -------------------- Modos de prueba --------------------
@@ -110,6 +128,18 @@ def save_row(row):
 
 def add_event(msg, level="INFO"):
     st.session_state.events.append({"time": now_str(), "level": level, "msg": msg})
+
+def parse_dtc_code(dtc_str: str) -> str:
+    if not dtc_str or dtc_str == "OK":
+        return ""
+    # "P0101 (....)" -> "P0101"
+    token = dtc_str.strip().split()[0]
+    if token.startswith("P") and len(token) >= 5:
+        return token[:5]
+    # "P0171/P0172 ..." -> devuelve el primero
+    if "/" in token and token.split("/")[0].startswith("P"):
+        return token.split("/")[0][:5]
+    return ""
 
 # -------------------- Simulación --------------------
 def apply_fault(row, fault):
@@ -194,7 +224,7 @@ def coherence_checks(row):
     if speed > 10 and rpm < 700:
         issues.append(("ALERT", "Velocidad > 10 km/h con RPM muy bajas (posible fallo sensor RPM)."))
     if map_kpa > 160 and rpm < 1400:
-        issues.append(("WARN", "MAP alto con RPM bajas (posible fallo MAP/boost o fuga/actuador)."))
+        issues.append(("WARN", "MAP alto con RPM bajas (posible fallo MAP/actuador o fuga/actuador)."))
     if maf < 2.0 and rpm > 2000:
         issues.append(("WARN", "MAF bajo con RPM altas (posible MAF sucio o restricción admisión)."))
     if voltage < 12.0:
@@ -207,6 +237,98 @@ def coherence_checks(row):
         issues.append(("WARN", "Fuel Trim elevado: posible fuga/toma de aire/inyectores/MAF."))
 
     return issues
+
+# -------------------- Diagnóstico automático (explicación técnica) --------------------
+def auto_diagnosis(last: dict, issues: list) -> list:
+    """
+    Devuelve lista de dicts: {Categoria, Hallazgo, Explicacion, Severidad}
+    """
+    out = []
+
+    dtc = str(last.get("dtc", "OK"))
+    code = parse_dtc_code(dtc)
+    if dtc != "OK":
+        exp = DTC_INFO.get(code, "Código DTC detectado. Consultar tabla del fabricante y seguir procedimiento de diagnosis.")
+        out.append({
+            "Categoria": "DTC",
+            "Hallazgo": dtc,
+            "Explicacion": exp,
+            "Severidad": "WARN" if "intermit" in dtc.lower() else "ALERT"
+        })
+
+    # Fuel trim (mezcla)
+    ft = float(last.get("fuel_trim_pct", 0))
+    if abs(ft) >= 15:
+        if ft > 0:
+            out.append({
+                "Categoria": "Mezcla (Fuel Trim)",
+                "Hallazgo": f"Fuel Trim +{ft:.1f}%",
+                "Explicacion": "Mezcla pobre: la ECU añade combustible. Causas típicas: fuga de aire en admisión, MAF subestimando, baja presión de combustible, inyectores obstruidos.",
+                "Severidad": "WARN"
+            })
+        else:
+            out.append({
+                "Categoria": "Mezcla (Fuel Trim)",
+                "Hallazgo": f"Fuel Trim {ft:.1f}%",
+                "Explicacion": "Mezcla rica: la ECU reduce combustible. Causas típicas: inyectores goteando, presión combustible alta, EVAP, MAF sobreestimando.",
+                "Severidad": "WARN"
+            })
+
+    # Lambda fuera de rango
+    lam = float(last.get("lambda", 1.0))
+    if lam > 1.15:
+        out.append({
+            "Categoria": "Lambda",
+            "Hallazgo": f"Lambda alta ({lam:.2f})",
+            "Explicacion": "Indica tendencia a mezcla pobre o lectura anómala. Revisar fugas de admisión/escape y estado de sonda lambda.",
+            "Severidad": "ALERT"
+        })
+    elif lam < 0.85:
+        out.append({
+            "Categoria": "Lambda",
+            "Hallazgo": f"Lambda baja ({lam:.2f})",
+            "Explicacion": "Indica mezcla rica o lectura anómala. Revisar presión de combustible, inyectores, EVAP y sonda lambda.",
+            "Severidad": "ALERT"
+        })
+
+    # Incoherencias MAF/MAP
+    mapk = int(last.get("map_kPa", 0))
+    rpm = int(last.get("rpm", 0))
+    maf = float(last.get("maf_gps", 0))
+    if mapk > 160 and rpm < 1400:
+        out.append({
+            "Categoria": "Coherencia MAF/MAP",
+            "Hallazgo": f"MAP alto ({mapk} kPa) con RPM bajas ({rpm})",
+            "Explicacion": "Posible sensor MAP defectuoso, actuador/boost incoherente o fuga. Revisar sensor/conexiones y mangueras.",
+            "Severidad": "WARN"
+        })
+    if maf < 2.0 and rpm > 2000:
+        out.append({
+            "Categoria": "Coherencia MAF/MAP",
+            "Hallazgo": f"MAF bajo ({maf:.2f} g/s) con RPM altas ({rpm})",
+            "Explicacion": "Posible MAF sucio, filtro de aire obstruido o restricción en admisión. Revisar filtro y limpiar/probar MAF.",
+            "Severidad": "WARN"
+        })
+
+    # Reflejar issues de coherencia (lo que ya calculabas)
+    for level, msg in issues:
+        out.append({
+            "Categoria": "Coherencias",
+            "Hallazgo": msg,
+            "Explicacion": "Regla automática: patrón de sensores incoherente para ese modo de funcionamiento.",
+            "Severidad": level
+        })
+
+    # Si no hay nada, estado OK
+    if not out:
+        out.append({
+            "Categoria": "OK",
+            "Hallazgo": "Sin incidencias relevantes",
+            "Explicacion": "Valores dentro de rango y coherencias correctas para el modo seleccionado.",
+            "Severidad": "OK"
+        })
+
+    return out
 
 # -------------------- Score 0-100 --------------------
 def compute_health_score(df):
@@ -283,8 +405,8 @@ def make_pdf_chart(df_last60: pd.DataFrame) -> BytesIO:
     buf.seek(0)
     return buf
 
-# -------------------- PDF PRO mejorado --------------------
-def build_pdf_report_pro(df, last, score, warn_total, alert_total, dtc_total, recs, vehicle, events_df) -> bytes:
+# -------------------- PDF PRO mejorado + diagnóstico automático --------------------
+def build_pdf_report_pro(df, last, score, warn_total, alert_total, dtc_total, recs, vehicle, events_df, diag_rows) -> bytes:
     buf = BytesIO()
 
     def footer(canvas, doc):
@@ -460,20 +582,61 @@ def build_pdf_report_pro(df, last, score, warn_total, alert_total, dtc_total, re
     t_state.setStyle(ts)
     elements.append(t_state)
 
+    # Diagnóstico automático (NUEVO)
+    elements.append(Paragraph("4. Diagnóstico automático (explicación técnica)", H2))
+    diag_table_rows = [["Categoría", "Hallazgo", "Explicación", "Sev."]]
+    for r in diag_rows:
+        diag_table_rows.append([
+            str(r.get("Categoria","")),
+            str(r.get("Hallazgo","")),
+            str(r.get("Explicacion","")),
+            str(r.get("Severidad","")),
+        ])
+
+    t_diag = Table(diag_table_rows, colWidths=[1.0*inch, 1.7*inch, 2.9*inch, 0.5*inch])
+    td = TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("GRID", (0,0), (-1,-1), 0.35, colors.lightgrey),
+        ("FONTSIZE", (0,0), (-1,-1), 8.6),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F9FAFB")]),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ])
+    # colorear columna severidad
+    for i in range(1, len(diag_table_rows)):
+        sev = diag_table_rows[i][3]
+        if sev == "OK":
+            td.add("BACKGROUND", (3,i), (3,i), colors.HexColor("#E8F5E9"))
+            td.add("TEXTCOLOR", (3,i), (3,i), colors.HexColor("#1B5E20"))
+        elif sev == "WARN":
+            td.add("BACKGROUND", (3,i), (3,i), colors.HexColor("#FFF8E1"))
+            td.add("TEXTCOLOR", (3,i), (3,i), colors.HexColor("#F57F17"))
+        else:
+            td.add("BACKGROUND", (3,i), (3,i), colors.HexColor("#FFEBEE"))
+            td.add("TEXTCOLOR", (3,i), (3,i), colors.HexColor("#B71C1C"))
+        td.add("FONTNAME", (3,i), (3,i), "Helvetica-Bold")
+    t_diag.setStyle(td)
+    elements.append(t_diag)
+
     # Gráfico tendencia
-    elements.append(Paragraph("4. Gráfico de tendencia", H2))
+    elements.append(Paragraph("5. Gráfico de tendencia", H2))
     chart_buf = make_pdf_chart(df.tail(60))
     img = RLImage(chart_buf, width=6.1*inch, height=2.0*inch)
     img.hAlign = "CENTER"
     elements.append(img)
 
     # Recomendaciones
-    elements.append(Paragraph("5. Recomendaciones técnicas", H2))
+    elements.append(Paragraph("6. Recomendaciones técnicas", H2))
     for r in recs:
         elements.append(Paragraph(f"• {r}", normal))
 
     # Eventos
-    elements.append(Paragraph("6. Registro de eventos", H2))
+    elements.append(Paragraph("7. Registro de eventos", H2))
     if events_df is not None and len(events_df) > 0:
         tail = events_df.tail(10).copy()
         ev_rows = [["Hora", "Nivel", "Evento"]]
@@ -497,8 +660,8 @@ def build_pdf_report_pro(df, last, score, warn_total, alert_total, dtc_total, re
     else:
         elements.append(Paragraph("No se registraron eventos relevantes.", normal))
 
-    # Veredicto final (caja)
-    elements.append(Paragraph("7. Veredicto final", H2))
+    # Veredicto final
+    elements.append(Paragraph("8. Veredicto final", H2))
     if score >= 85 and alert_total == 0 and dtc_total == 0:
         verdict = "Estado electrónico muy bueno. No se observan incidencias relevantes."
     elif score >= 70:
@@ -521,10 +684,127 @@ def build_pdf_report_pro(df, last, score, warn_total, alert_total, dtc_total, re
     doc.build(elements, onFirstPage=footer, onLaterPages=footer)
     return buf.getvalue()
 
+# -------------------- Excel PRO (xlsx) --------------------
+def make_excel_pro(df: pd.DataFrame, vehicle: dict, score: int, warn_total: int, alert_total: int, dtc_total: int, diag_rows: list) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sesion"
+
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(color="FFFFFF", bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    wrap = Alignment(wrap_text=True, vertical="top")
+    ok_fill = PatternFill("solid", fgColor="E8F5E9")
+    warn_fill = PatternFill("solid", fgColor="FFF8E1")
+    alert_fill = PatternFill("solid", fgColor="FFEBEE")
+
+    # Orden columnas
+    order = ["time","mode","rpm","speed","coolant_C","voltage_V","map_kPa","lambda","maf_gps","fuel_trim_pct","dtc"]
+    dfx = df.copy()
+    for c in order:
+        if c not in dfx.columns:
+            dfx[c] = ""
+    dfx = dfx[order]
+
+    # Escribir cabecera
+    ws.append(order)
+    for j, col in enumerate(order, start=1):
+        cell = ws.cell(row=1, column=j)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    # Filas
+    for _, r in dfx.iterrows():
+        ws.append([r[c] for c in order])
+
+    ws.freeze_panes = "A2"
+
+    # Ajustar anchos
+    for col_idx, col_name in enumerate(order, start=1):
+        max_len = len(col_name)
+        for i in range(2, min(ws.max_row, 250) + 1):
+            v = ws.cell(row=i, column=col_idx).value
+            max_len = max(max_len, len(str(v)) if v is not None else 0)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 30)
+
+    # Colorear DTC
+    dtc_col = order.index("dtc") + 1
+    for i in range(2, ws.max_row + 1):
+        dtc_val = str(ws.cell(row=i, column=dtc_col).value)
+        if dtc_val and dtc_val != "OK":
+            ws.cell(row=i, column=dtc_col).fill = alert_fill
+            ws.cell(row=i, column=dtc_col).font = Font(bold=True, color="B71C1C")
+
+    # Hoja Resumen
+    ws2 = wb.create_sheet("Resumen")
+    ws2["A1"] = "AutoCheck — Resumen de diagnóstico"
+    ws2["A1"].font = Font(bold=True, size=16)
+    ws2["A3"] = "Índice de salud"
+    ws2["B3"] = f"{score}/100"
+    ws2["A4"] = "WARN"
+    ws2["B4"] = warn_total
+    ws2["A5"] = "ALERT"
+    ws2["B5"] = alert_total
+    ws2["A6"] = "DTC detectados"
+    ws2["B6"] = dtc_total
+
+    # Datos vehículo
+    ws2["D3"] = "Operador"
+    ws2["E3"] = vehicle.get("operador","") or "-"
+    ws2["D4"] = "Vehículo"
+    ws2["E4"] = vehicle.get("marca_modelo","") or "-"
+    ws2["D5"] = "Motor"
+    ws2["E5"] = vehicle.get("motor","") or "-"
+    ws2["D6"] = "KM"
+    ws2["E6"] = vehicle.get("km",0)
+
+    # Diagnóstico automático
+    ws2["A8"] = "Diagnóstico automático (explicación técnica)"
+    ws2["A8"].font = Font(bold=True, size=12)
+
+    diag_headers = ["Categoría", "Hallazgo", "Explicación", "Sev."]
+    ws2.append([])  # fila vacía
+    ws2.append(diag_headers)
+    header_row = ws2.max_row
+    for j in range(1, 5):
+        c = ws2.cell(row=header_row, column=j)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = center
+
+    for r in diag_rows:
+        ws2.append([r.get("Categoria",""), r.get("Hallazgo",""), r.get("Explicacion",""), r.get("Severidad","")])
+
+    # Formato diagnóstico
+    for i in range(header_row + 1, ws2.max_row + 1):
+        ws2.cell(row=i, column=1).alignment = wrap
+        ws2.cell(row=i, column=2).alignment = wrap
+        ws2.cell(row=i, column=3).alignment = wrap
+        sev = str(ws2.cell(row=i, column=4).value)
+        ws2.cell(row=i, column=4).alignment = center
+        if sev == "OK":
+            ws2.cell(row=i, column=4).fill = ok_fill
+        elif sev == "WARN":
+            ws2.cell(row=i, column=4).fill = warn_fill
+        else:
+            ws2.cell(row=i, column=4).fill = alert_fill
+            ws2.cell(row=i, column=4).font = Font(bold=True, color="B71C1C")
+
+    # Ajustar anchos resumen
+    widths = {1: 18, 2: 28, 3: 65, 4: 8, 5: 24}
+    for col, w in widths.items():
+        ws2.column_dimensions[get_column_letter(col)].width = w
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
 # -------------------- STREAMLIT UI --------------------
 st.set_page_config(page_title="AutoCheck - Multisensor", layout="wide")
 st.title("AutoCheck — Monitor Multisensor (SIMULACIÓN)")
-st.caption("Lectura simultánea + grabación + diagnosis + score 0–100 + informe PDF profesional.")
+st.caption("Lectura simultánea + grabación + diagnosis + score 0–100 + informe PDF profesional + Excel PRO.")
 
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -575,7 +855,7 @@ with c_clear:
         st.session_state.started_at = None
         st.success("Sesión borrada.")
 with c_tip:
-    st.caption("Para demostrar la innovación: activa un fallo → verás WARN/ALERT + baja el score y queda reflejado en el PDF.")
+    st.caption("Para demostrar la innovación: activa un fallo → verás WARN/ALERT + baja el score y queda reflejado en el PDF y Excel PRO.")
 
 df = load_df()
 
@@ -608,24 +888,32 @@ else:
         "fuel_trim_pct": float(last["fuel_trim_pct"]),
     })
 
-    # Log de eventos (evitamos repetir demasiado)
+    # Log de eventos
     if str(last["dtc"]) != "OK":
         add_event(f"DTC detectado: {last['dtc']}", "WARN")
     for level, msg in issues:
         add_event(msg, level)
 
-    # Recomendaciones
+    # Diagnóstico automático (nuevo)
+    diag_rows = auto_diagnosis(last, issues)
+    diag_df = pd.DataFrame(diag_rows)
+
+    # Recomendaciones (mejoradas con diagnóstico)
     recs = []
     if dtc_n > 0:
-        recs.append("Existen DTC: borrar/leer, comprobar si reaparecen y revisar componentes asociados.")
+        recs.append("DTC presentes: borrar/leer, comprobar si reaparecen y seguir procedimiento del fabricante.")
     if alert_total > 0:
-        recs.append("Hay valores críticos: revisar sistema eléctrico/refrigeración/mezcla según el sensor.")
+        recs.append("Valores críticos: revisar sistema eléctrico/refrigeración/mezcla según el sensor afectado.")
+    if any(r.get("Categoria","").startswith("Mezcla") for r in diag_rows):
+        recs.append("Si hay mezcla pobre/rica: revisar fugas admisión, presión combustible, MAF y estado de inyectores.")
+    if any("MAF" in str(r.get("Hallazgo","")) or "MAP" in str(r.get("Hallazgo","")) for r in diag_rows):
+        recs.append("Si hay incoherencias MAF/MAP: revisar admisión (filtro/fugas), sensores y conectores.")
     if score < 70:
         recs.append("Ampliar diagnosis: prueba dinámica, comprobación de fugas y verificación MAP/MAF/Lambda.")
     if not recs:
-        recs.append("Sin incidencias destacables: mantener vigilancia y revisar historial de mantenimiento.")
+        recs.append("Sin incidencias destacables: mantenimiento preventivo y seguimiento periódico.")
 
-    # MÉTRICAS (como antes, completo)
+    # MÉTRICAS
     band_text, _ = score_band(score)
     a, b, c, d, e = st.columns([1.4, 1, 1.6, 0.8, 0.8])
     with a:
@@ -642,7 +930,7 @@ else:
 
     st.divider()
 
-    # Estado por sensor en la web (tabla)
+    # Estado por sensor
     st.subheader("Estado por sensor (OK / WARN / ALERT)")
     rows = []
     for key, (label, unit) in SENSOR_META.items():
@@ -653,10 +941,14 @@ else:
     # Diagnosis coherencias
     st.subheader("Diagnosis inteligente (coherencias)")
     if issues:
-        st.warning("Se han detectado incoherencias. Quedarán registradas en el informe PDF.")
+        st.warning("Se han detectado incoherencias. Quedarán registradas en el PDF y en el Excel PRO.")
         st.dataframe(pd.DataFrame([{"Nivel": lv, "Mensaje": ms} for lv, ms in issues]), use_container_width=True)
     else:
         st.success("Sin incoherencias relevantes en este instante.")
+
+    # Diagnóstico automático (nuevo)
+    st.subheader("🧠 Diagnóstico automático (explicación técnica)")
+    st.dataframe(diag_df[["Categoria","Hallazgo","Severidad","Explicacion"]], use_container_width=True)
 
     # Gráficas web
     st.subheader("Gráficas (últimos 60 registros)")
@@ -670,10 +962,21 @@ else:
 
     # Descargas
     st.subheader("Descargas")
+
+    # CSV internacional
     st.download_button(
-        "📥 Descargar CSV (sesión)",
+        "📥 Descargar CSV (internacional)",
         data=df.to_csv(index=False).encode("utf-8"),
         file_name="autocheck_sesion.csv",
+        mime="text/csv"
+    )
+
+    # CSV Excel España (para que no salga todo en una columna)
+    csv_excel_es = df.to_csv(index=False, sep=";", decimal=",")
+    st.download_button(
+        "📥 Descargar CSV (Excel España)",
+        data=csv_excel_es.encode("utf-8"),
+        file_name="autocheck_sesion_excel_es.csv",
         mime="text/csv"
     )
 
@@ -687,6 +990,24 @@ else:
         "started_at": st.session_state.get("started_at"),
     }
 
+    # Excel PRO
+    xlsx_bytes = make_excel_pro(
+        df=df,
+        vehicle=vehicle,
+        score=score,
+        warn_total=warn_total,
+        alert_total=alert_total,
+        dtc_total=dtc_n,
+        diag_rows=diag_rows
+    )
+    st.download_button(
+        "📊 Descargar Excel (.xlsx) PRO",
+        data=xlsx_bytes,
+        file_name="AutoCheck_Sesion_PRO.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # PDF PRO + diagnóstico automático dentro
     pdf_bytes = build_pdf_report_pro(
         df=df,
         last=last,
@@ -697,6 +1018,7 @@ else:
         recs=recs,
         vehicle=vehicle,
         events_df=ev,
+        diag_rows=diag_rows
     )
 
     st.download_button(
